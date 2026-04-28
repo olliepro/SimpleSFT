@@ -1,0 +1,18 @@
+\section{Measurement and Evaluation Method}
+As a ground-truth target for estimator development, we measured the memory usage
+of various parallel training strategies. SimpleSFT runs
+real CUDA microsteps and records memory use around the training phases that the
+analytical model predicts. Measurements are collected once, saved with their configurations, and
+used during analytical model calibration.
+
+DDP runs use \texttt{torchrun}. Each rank measures its own local microstep,
+serializes a \texttt{MemoryResult}, and rank zero stores a conservative
+max-across-ranks aggregate. ZeRO-2 and ZeRO-3 use a DeepSpeed launcher with the
+same stage, bucket, prefetch, overlap, reduce-scatter, all-gather, and precision
+settings used by the estimator. Single-rank ZeRO measurement is rejected
+because sharding requires more than one rank.
+
+The measured breakdown records live parameter bytes, gradient bytes,
+optimizer-state bytes, retained activation bytes, runtime reserve, and
+transient remainder. Synthetic text batches keep the sequence length and label
+shape controlled across runs.

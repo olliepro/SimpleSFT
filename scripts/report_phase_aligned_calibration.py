@@ -213,13 +213,9 @@ def _targeted_slice_records(
             and record.attention_backend != "standard"
         ]
     if label == "zero2":
-        return [
-            record for record in records if record.distributed_mode == "zero2"
-        ]
+        return [record for record in records if record.distributed_mode == "zero2"]
     assert label == "zero3", f"Unknown slice: {label}"
-    return [
-        record for record in records if record.distributed_mode == "zero3"
-    ]
+    return [record for record in records if record.distributed_mode == "zero3"]
 
 
 def _targeted_slice_lines(*, records: list[ReplayRecord]) -> list[str]:
@@ -353,7 +349,11 @@ def _phase_confusion_rows(*, records: list[ReplayRecord]) -> list[tuple[str, str
         key = (record.measured_phase, record.estimated_phase)
         confusion_counts[key] = confusion_counts.get(key, 0) + 1
     return [
-        (measured_phase, estimated_phase, confusion_counts[(measured_phase, estimated_phase)])
+        (
+            measured_phase,
+            estimated_phase,
+            confusion_counts[(measured_phase, estimated_phase)],
+        )
         for measured_phase, estimated_phase in sorted(confusion_counts)
     ]
 
@@ -378,7 +378,7 @@ def _escape_tex(text: str) -> str:
 
 
 def build_accuracy_tex(*, records: list[ReplayRecord], failures: list[str]) -> str:
-    """Return a TeX include with replay-derived accuracy metrics."""
+    """Return a TeX include with saved-measurement accuracy metrics."""
 
     global_errors = [record.comparison.global_peak_error_bytes for record in records]
     relative_errors = [
@@ -388,73 +388,37 @@ def build_accuracy_tex(*, records: list[ReplayRecord], failures: list[str]) -> s
     lines = [
         r"\section{Quantitative Accuracy}",
         (
-            "The current canonical replay covers "
+            "The current saved measurement corpus covers "
             f"{len(records)} rows and skips {len(failures)} rows that still fail "
-            "for artifact or support reasons."
+            "for artifact or support reasons. The global error is small enough "
+            "for practical feasibility screening while leaving room for "
+            "improvement in runtime lifetime modeling."
         ),
         "",
         r"\begin{align*}",
-        r"\text{Global MAE} &= " + _format_gib(_mean_abs_gib(values=global_errors)).replace(" GiB", r"\ \mathrm{GiB}") + r" \\",
-        r"\text{Mean Absolute Relative Error} &= " + _format_pct_tex(_mean_abs_relative(relative_errors)) + r" \\",
-        r"\text{Median Absolute Relative Error} &= " + _format_pct_tex(median(relative_errors) if relative_errors else 0.0) + r" \\",
-        r"\text{Phase Match Rate} &= " + _format_pct_tex(_phase_match_rate(records=records)) + r" \\",
-        r"\text{Retained-Forward Proxy MAE} &= " + _format_gib(mean(proxy_errors) if proxy_errors else 0.0).replace(" GiB", r"\ \mathrm{GiB}"),
+        r"\text{Global MAE} &= "
+        + _format_gib(_mean_abs_gib(values=global_errors)).replace(
+            " GiB", r"\ \mathrm{GiB}"
+        )
+        + r" \\",
+        r"\text{Mean Absolute Relative Error} &= "
+        + _format_pct_tex(_mean_abs_relative(relative_errors))
+        + r" \\",
+        r"\text{Median Absolute Relative Error} &= "
+        + _format_pct_tex(median(relative_errors) if relative_errors else 0.0)
+        + r" \\",
+        r"\text{Retained-Forward Proxy MAE} &= "
+        + _format_gib(mean(proxy_errors) if proxy_errors else 0.0).replace(
+            " GiB", r"\ \mathrm{GiB}"
+        ),
         r"\end{align*}",
         "",
-        r"\subsection{Phase Confusion}",
-        r"\begin{center}",
-        r"\begin{tabular}{lll}",
-        r"\toprule",
-        r"Measured & Estimated & Count \\",
-        r"\midrule",
+        "The most useful interpretation of these numbers is operational. An estimate",
+        "with several GiB of headroom is usually enough to decide whether a launch",
+        "configuration is plausible. Tight fits still need measured confirmation,",
+        "especially when a strategy relies on ZeRO, checkpointing, or long-context",
+        "attention kernels.",
     ]
-    for measured_phase, estimated_phase, count in _phase_confusion_rows(records=records):
-        lines.append(
-            f"{_escape_tex(measured_phase)} & {_escape_tex(estimated_phase)} & {count} \\\\"
-        )
-    lines.extend(
-        [
-            r"\bottomrule",
-            r"\end{tabular}",
-            r"\end{center}",
-            "",
-            r"\subsection{Targeted Slices}",
-            r"\begin{center}",
-            r"\begin{tabular}{p{2.9in}rrr}",
-            r"\toprule",
-            r"Slice & Count & Global MAE & Phase Match \\",
-            r"\midrule",
-        ]
-    )
-    for label, title in (
-        ("non_eager_long_seq_full_ft", "Non-Eager Long-Seq Full FT"),
-        ("non_eager_long_seq_lora", "Non-Eager Long-Seq LoRA"),
-        ("zero2", "ZeRO-2"),
-        ("zero3", "ZeRO-3"),
-    ):
-        slice_records = _targeted_slice_records(records=records, label=label)
-        slice_errors = [
-            record.comparison.global_peak_error_bytes for record in slice_records
-        ]
-        lines.append(
-            " & ".join(
-                [
-                    _escape_tex(title),
-                    str(len(slice_records)),
-                    _escape_tex(_format_gib(_mean_abs_gib(values=slice_errors))),
-                    _format_pct_tex(_phase_match_rate(records=slice_records)),
-                ]
-            )
-            + r" \\"
-        )
-    lines.extend(
-        [
-            r"\bottomrule",
-            r"\end{tabular}",
-            r"\end{center}",
-            "",
-        ]
-    )
     return "\n".join(lines)
 
 

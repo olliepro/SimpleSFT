@@ -9,6 +9,8 @@ benchmark_artifacts/
 tmp-report-suite/
 slurm-*.out
 estimator_report/*.aux
+estimator_report/*.bbl
+estimator_report/*.blg
 estimator_report/*.fdb_latexmk
 estimator_report/*.fls
 estimator_report/*.log

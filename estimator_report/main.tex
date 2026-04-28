@@ -6,12 +6,13 @@
 \usepackage{lmodern}
 \usepackage{amsmath,amssymb,mathtools}
 \usepackage{booktabs}
+\usepackage{graphicx}
 \usepackage{array}
 \usepackage{enumitem}
 \usepackage[hidelinks]{hyperref}
 \usepackage{microtype}
 
-\title{How the SimpleSFT Memory Estimator Works}
+\title{SimpleSFT Project Report}
 \author{}
 \date{\today}
 
@@ -21,9 +22,35 @@
 \begin{document}
 \maketitle
 
+\begin{abstract}
+SimpleSFT estimates whether supervised fine-tuning jobs for popular research
+LLMs, including Qwen-family models, will fit on available GPU resources before
+launch. The project combines a typed analytical memory model, CUDA-based
+measurement tools, saved benchmark comparisons, and configuration search.
+A user-friendly web UI recommends training strategies based on the estimator's output and exports
+a TRL-compatible YAML strategy for the selected configuration. The current
+estimator shows a global mean absolute error of 1.332 GiB and a median relative
+error of 6.1 percent on a saved measurement corpus, which is strong for pre-launch
+screening when users keep 10\% headroom.
+\end{abstract}
+
 \input{sections/01_intro}
 \input{sections/02_resident_activation}
-\input{sections/03_workspace_phase}
+\input{sections/04_strategy_workflow}
+\input{sections/05_measurement_evaluation}
 \input{generated/accuracy_summary}
+\input{sections/06_limitations_related_work}
+\bibliographystyle{plain}
+\bibliography{references}
+
+\clearpage
+\appendix
+\section{Web Interface Screenshot}
+\begin{figure}[h]
+\centering
+\includegraphics[width=\textwidth,height=0.82\textheight,keepaspectratio]{sections/image.png}
+\caption{SimpleSFT web interface showing an example estimate and ranked candidate strategies.}
+\label{fig:web-interface-screenshot}
+\end{figure}
 
 \end{document}

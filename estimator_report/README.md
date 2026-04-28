@@ -1,7 +1,8 @@
-# Estimator Report
+# SimpleSFT Project Report
 
-This directory contains a LaTeX write-up of the current analytical memory
-estimator used by `SimpleSFT`.
+This directory contains a LaTeX project report for `SimpleSFT`, including the
+analytical memory estimator, strategy-selection workflow, measurement method,
+validation summary, and current limitations.
 
 Build the PDF with:
 

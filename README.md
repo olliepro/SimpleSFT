@@ -51,6 +51,8 @@ simplesft report --input-dir benchmark_artifacts/iter1 --iteration-name "Iterati
 The web UI is a local stdlib server. It exposes a form-driven estimator
 workbench on `/` and a JSON API on `/api/estimate`.
 
+![SimpleSFT web UI screenshot](estimator_report/sections/image.png)
+
 ## Training (SFT)
 
 SimpleSFT can export a feasible training strategy (batch size, seq len, precision, LoRA vs full fine-tune, etc.) into a Hugging Face TRL-compatible YAML file, and then run an actual supervised fine-tuning job using TRL's `SFTTrainer`.

@@ -1,0 +1,60 @@
+\section{Limitations and Future Work}
+Several parts of the estimator still depend on calibrated runtime assumptions.
+Runtime support and optimizer-step carryover are fudge terms that account for memory overhead outside the analytical model's current coverage.
+Additionally, the slowdown score used for recommendations should become a measured timing model.
+
+The next technical step is to connect timing and memory in the same artifact.
+The memory estimator already ranks feasibility well enough for pre-launch
+screening. A measured timing model would make slowdown estimates less
+heuristic, especially for ZeRO-3, checkpointing, and tensor-parallel jobs where
+communication and recomputation dominate user-visible cost.
+
+\section{Related Work}
+SimpleSFT follows prior work on memory-aware fine-tuning and distributed
+training while targeting a narrower workflow: fast SFT strategy selection on
+research LLMs before launch. LLMem estimates memory for distributed
+fine-tuning and recommends methods for multi-GPU LLM training
+\cite{kim2024llmem}, but it lacks modern attention backends and support for LoRA. Empirical work on distributed Transformer training
+studies how model architecture and distributed strategy interact with memory
+and performance \cite{lu2024distributed}. Broader resource-management work
+compares analytical, CPU-side, and learning-based estimators for GPU memory and
+utilization \cite{yousefzadeh2026gpu}. SimpleSFT uses the same general
+motivation, then adds project-specific measurement artifacts and SFT-oriented
+strategy export.
+
+\begin{center}
+\small
+\begin{tabular}{@{}>{\raggedright\arraybackslash}p{0.31\linewidth}p{0.59\linewidth}@{}}
+\toprule
+Work & Relationship to SimpleSFT \\
+\midrule
+LLMem \cite{kim2024llmem} & Analytical GPU-memory estimation for LLM
+fine-tuning and method recommendation across distributed training settings. It was calibrated using older models and different data regimes. \\
+Transformer training study \cite{lu2024distributed} & Empirical view of
+memory and performance behavior under distributed training choices. \\
+Training-aware resource management \cite{yousefzadeh2026gpu} & Broader
+resource-management framing for memory and utilization prediction. \\
+\bottomrule
+\end{tabular}
+\normalsize
+\end{center}
+
+This work builds directly on prior work in training optimization. LoRA
+reduces trainable state by injecting low-rank adapter matrices into frozen base
+models \cite{hu2021lora}. ZeRO shards redundant training state across data
+parallel ranks \cite{rajbhandari2020zero}. FlashAttention changes the memory
+shape of attention through IO-aware tiling that avoids the full quadratic score
+matrix \cite{dao2022flashattention}. These methods are common in current LLM
+fine-tuning practice, including Qwen-family research workflows \cite{qwen25}.
+
+\section{Conclusion}
+SimpleSFT gives researchers a practical way to plan SFT jobs before reserving
+scarce GPU time. The estimator connects inspected model structure with
+distributed training choices, LoRA, checkpointing, FlashAttention, optimizer
+state, and CUDA runtime support. The result is a phase-level estimate that can
+guide resource selection and clarify the expected source of memory pressure.
+
+The current saved measurement corpus shows a global mean absolute error of
+1.332 GiB and a median relative error of 6.1 percent. Those numbers are strong
+for pre-launch screening, especially when users keep several GiB of memory
+headroom.

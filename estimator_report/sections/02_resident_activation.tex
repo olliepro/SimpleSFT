@@ -1,381 +1,205 @@
-\section{Resident State}
-Resident state is the memory floor that exists before we talk about
-phase-specific activations or temporary workspace. A useful beginner rule is:
-
-\begin{quote}
-If the rank still owns the object even while no kernel is actively running,
-that object belongs in the resident floor.
-\end{quote}
-
-\subsection{The Basic Byte Rule}
-Every resident tensor follows the same local accounting rule:
+\section{Estimator Model}
+SimpleSFT treats a training step as three candidate peaks:
 \[
-\text{local bytes} = \text{local elements} \times \text{bytes per element}.
+M_{\mathrm{peak}} =
+\max(M_{\mathrm{forward}}, M_{\mathrm{backward}}, M_{\mathrm{optimizer}}).
 \]
+Forward starts from parameters and runtime support. Backward adds gradients and
+backward-live activation state. The optimizer step adds update scratch,
+communication buckets, and phase carryover. This breakdown gives a useful
+structure for model design and calibration because each estimator change can be
+attached to a specific phase and memory family.
 
-The only real question is what ``local'' means. Tensor parallelism reduces the
-visible width of some tensors. ZeRO may further shard trainable tensors across
-the data-parallel group. Once those local element counts are known, the byte
-computation itself is straightforward.
+\subsection{Inputs}
+The estimator combines a \texttt{ModelSpec} and an \texttt{EstimatorConfig}.
+The model spec supplies architecture and tensor metadata: parameter shapes,
+linear-layer roles, attention widths, vocabulary size, layer count, and
+tensor-parallel layout annotations. The config supplies the training strategy:
+tuning mode, optimizer, dtypes, sequence length, GPU budget, attention backend,
+checkpointing, LoRA settings, distributed mode, tensor and sequence parallel
+choices, runtime-support assumptions, and DDP/ZeRO bucket sizes.
 
-The two local-count rules that show up throughout the estimator are:
-\begin{align*}
-n_{\mathrm{local,tp}} &\approx \dfrac{n}{d_{\mathrm{tp}}}, \\
-n_{\mathrm{local,zero}} &\approx \dfrac{n_{\mathrm{local,tp}}}{D_{\mathrm{P}}}.
-\end{align*}
-In words: first shard by tensor parallel if that tensor is TP-visible, then
-shard again by the data-parallel group if the ZeRO stage owns that object in
-shards.
-The implementation still rounds to whole elements, but the rounded form does
-not add much intuition here, so this report shows the simpler proportional
-version.
-
-\subsection{Parameters}
-Parameter bytes are the cleanest part of the estimator.
-
-\paragraph{Full fine-tuning.}
-All base-model parameters are trainable and therefore matter for:
-\begin{itemize}[leftmargin=1.5em]
-\item resident parameter memory,
-\item gradient memory,
-\item optimizer state,
-\item and, if enabled, master weights.
-\end{itemize}
-
-\paragraph{LoRA.}
-The frozen base model is still resident because the forward pass needs it, but
-only the synthetic adapter parameters are trainable. That distinction matters:
-LoRA still pays for the base weights in the resident floor, but it does not pay
-for full-model gradients or full-model optimizer state.
-
-\paragraph{ZeRO stages.}
-The most important resident distinction is:
-\begin{itemize}[leftmargin=1.5em]
-\item \texttt{zero2}: parameters remain replicated, even though gradients and
-optimizer state are sharded.
-\item \texttt{zero3}: trainable parameters are also sharded across the
-data-parallel group.
-\end{itemize}
-
-At a high level, the resident parameter term is:
-\[
-M_{\mathrm{params}} =
-M_{\mathrm{base\ weights}}
-+ M_{\mathrm{adapter\ weights}}.
-\]
-For full fine-tuning the adapter term is zero. For LoRA the base weights still
-exist, but the adapter term is the one that later drives trainable-state
-objects such as gradients and optimizer state.
-
-\subsection{Gradients}
-Gradient bytes are built from the trainable set, not from the entire parameter
-set. This is why LoRA can dramatically reduce gradient memory even though the
-base model remains resident.
-
-For distributed training, the estimator treats gradients as:
-\begin{itemize}[leftmargin=1.5em]
-\item replicated for single-GPU and DDP,
-\item sharded for ZeRO-2 and ZeRO-3.
-\end{itemize}
-
-That choice is structural. It reflects where gradients live at steady state,
-not where they may briefly appear during a communication window.
-
-Written compactly:
-\[
-M_{\mathrm{grads}} =
-\text{local trainable elements} \times \text{gradient bytes per element}.
-\]
-
-\subsection{Optimizer State}
-Optimizer state is also built from the trainable set. Different optimizers own
-different amounts of state:
-\begin{itemize}[leftmargin=1.5em]
-\item Adam and AdamW keep two auxiliary tensors per trainable tensor.
-\item SGD with no momentum keeps essentially none.
-\item RMSProp and Adagrad keep one state tensor.
-\item Adafactor is special because its state can be factored instead of dense.
-\end{itemize}
-
-This is one of the places where the estimator is more principled than a simple
-``optimizer multiplier'': it does not assume all optimizers behave the same.
-The optimizer family changes the actual state objects.
-
-The compact optimizer-state equation is:
-\[
-M_{\mathrm{opt}} =
-\sum_{p \in \mathcal{P}_{\mathrm{train}}}
-\rho_{\mathrm{opt}}(p)\, n_{\mathrm{local}}(p)\, b_o^\star,
-\]
-where $\rho_{\mathrm{opt}}(p)$ is the optimizer-state ratio for parameter $p$.
-
-\subsection{Master Weights}
-Master weights are optional fp32 copies used by some training setups. When they
-exist, they are part of the resident floor because they survive across the
-entire training step.
-
-\subsection{Runtime Support}
-Not every byte on a GPU belongs to a model tensor. CUDA, the caching allocator,
-NCCL, and DeepSpeed all keep their own support state. The estimator therefore
-models runtime support separately from tensor memory.
-
-The current model exposes four named support components:
-\begin{itemize}[leftmargin=1.5em]
-\item CUDA context support,
-\item allocator-pool support,
-\item NCCL support,
-\item DeepSpeed support.
-\end{itemize}
-
-If the caller wants full control, the estimator also allows one explicit
-runtime-support override. The important design choice is not the exact default
-numbers. It is that these bytes are now represented as named runtime objects
-instead of being hidden inside one opaque per-mode floor.
-
-That term is:
-\[
-M_{\mathrm{runtime}} =
-\begin{cases}
-M_{\mathrm{override}} & \text{if an explicit override is given}, \\
-M_{\mathrm{cuda}} + M_{\mathrm{alloc}} + M_{\mathrm{nccl}} + M_{\mathrm{ds}}
-& \text{otherwise.}
-\end{cases}
-\]
-
-\subsection{Persistent Backend Buffers}
-One more resident term appears in some distributed full fine-tuning regimes:
-persistent backend buffers. These are not model tensors in the usual sense.
-They stand for backend-managed storage that remains live across phases. The
-estimator keeps this term explicit because it is real memory, but it is not the
-same kind of object as a parameter or an activation.
-
-\subsection{The Two Resident Floors}
-After collecting those pieces, the estimator builds two floors:
-\begin{itemize}[leftmargin=1.5em]
-\item the \textbf{base floor}, which includes everything resident except
-gradients,
-\item the \textbf{gradient floor}, which is the base floor plus gradients.
-\end{itemize}
-
-Written compactly:
-\begin{align*}
-R_{\mathrm{base}} &= M_{\mathrm{params}} + M_{\mathrm{opt}}
-+ M_{\mathrm{master}} + M_{\mathrm{runtime}} + M_{\mathrm{persist}}, \\
-R_{\mathrm{grad}} &= R_{\mathrm{base}} + M_{\mathrm{grads}}.
-\end{align*}
-
-These two floors are enough for the phase model:
-\begin{itemize}[leftmargin=1.5em]
-\item forward starts from $R_{\mathrm{base}}$,
-\item backward and optimizer step start from $R_{\mathrm{grad}}$.
-\end{itemize}
-
-\section{Retained Activations}
-This is the part of the model that is easiest to misread, because many people
-informally use the word ``activations'' to mean several different things at
-once.
-
-\subsection{Visible Is Not The Same As Retained}
-The estimator makes a deliberate distinction:
-\begin{itemize}[leftmargin=1.5em]
-\item \textbf{hook-visible outputs} are tensors you can see in instrumentation,
-\item \textbf{retained forward state} is the subset that actually survives the
-end of forward,
-\item \textbf{backward activation state} is what remains alive during backward,
-including backward-only context.
-\end{itemize}
-
-This distinction is not cosmetic. A hook can see a tensor that is later freed
-before backward begins. Conversely, a tensor may be small in a hook trace but
-have a large effect because it is replicated across layers or preserved through
-checkpoint boundaries.
-
-\subsection{The Retained-Forward Proxy}
-The estimator gathers retained-forward state into one proxy term,
-$M_{\mathrm{proxy}}$. It is built from named tensor classes rather than one
-black-box multiplier. The important classes are:
-\begin{itemize}[leftmargin=1.5em]
-\item visible propagation state,
-\item checkpoint-boundary inputs,
-\item deduplicated saved linear inputs,
-\item MLP intermediates when they must survive,
-\item attention-saved state,
-\item LoRA low-rank intermediates,
-\item logits or loss context when needed,
-\item widened attention-path contexts for architectures whose attention widths
-are not all equal to the hidden size.
-\end{itemize}
-
-The key design choice here is explicit attribution. The proxy is not supposed
-to answer ``how much forward stuff exists somewhere.'' It is supposed to answer
-``which named forward objects are expected to survive into backward.''
-
-The compact summary is:
-\[
-M_{\mathrm{proxy}} =
-M_{\mathrm{visible}}
-+ M_{\mathrm{saved\_inputs}}
-+ M_{\mathrm{mlp}}
-+ M_{\mathrm{attn}}
-+ M_{\mathrm{lora}}
-+ M_{\mathrm{checkpoint}}
-+ M_{\mathrm{loss}}
-+ M_{\mathrm{widened}}.
-\]
-Not every regime activates every term, but this is the right way to think about
-the proxy: it is a sum of named retained object classes.
-
-\paragraph{Full fine-tuning.}
-When the whole stack is trainable and checkpointing is off, retained
-activations grow roughly like:
-\[
-M_{\mathrm{proxy}}^{\mathrm{full\_ft,\ no\ ckpt}}
-\propto
-L \cdot T_{\mathrm{local}} \cdot
-\left(H + I + d_{\mathrm{attn,path}}\right).
-\]
-That is the expensive regime most people expect: activation pressure grows
-linearly with depth and with local token count, and the MLP as well as the
-attention path can both matter.
-
-\paragraph{LoRA.}
-LoRA usually keeps much less activation state because only the targeted adapter
-paths are trainable:
-\[
-M_{\mathrm{proxy}}^{\mathrm{lora,\ no\ ckpt}}
-\propto
-L \cdot T_{\mathrm{local}} \cdot
-\left(d_{\mathrm{target\ path}} + r\right),
-\]
-where $r$ stands for the low-rank adapter width. The important point is not the
-exact symbol choice. It is that LoRA growth is still linear in depth and token
-count, but it is tied to the trainable adapter paths rather than the full
-hidden-plus-MLP stack.
-
-\paragraph{Backend contrast.}
-If the only thing you want to remember is how eager and non-eager attention
-differ, the comparison can be compressed into one small table:
+The inspected model metadata is highly detailed. For a
+Qwen-style model, the estimator needs the number of transformer blocks, the
+hidden width, the MLP expansion width, the number of attention heads, the number
+of key/value heads, the vocabulary projection shape, and the local role of each
+large matrix under tensor parallelism. The same total parameter count can lead
+to different memory behavior when the attention projection layout, MLP layout,
+or vocabulary tensor is sharded differently.
 
 \begin{center}
 \small
-\begin{tabular}{>{\raggedright\arraybackslash}p{1.0in}>{\raggedright\arraybackslash}p{1.8in}>{\raggedright\arraybackslash}p{2.65in}}
+\begin{tabular}{@{}p{0.28\linewidth}p{0.62\linewidth}@{}}
 \toprule
-Backend family & Extra retained-growth term & Interpretation \\
+Estimator input & Why it affects peak memory \\
 \midrule
-eager (\texttt{standard}) &
-$L \cdot T_{\mathrm{local}} \cdot S_{\mathrm{eff}} h_{\mathrm{local}}$ &
-The estimator carries an attention-score-like state that grows with effective
-sequence length and local head count. This is why eager attention becomes much
-more sequence-sensitive. \\
-non-eager (\texttt{sdpa}/\texttt{flash2}) &
-$L_{\mathrm{act}} \cdot T_{\mathrm{local}} \cdot d_{\mathrm{attn,path}}$ &
-The large score-retention term disappears. What remains is width-shaped context
-from the attention path, so growth stays linear in tokens. \\
+Parameter shapes & Drive parameter bytes, gradient bytes, optimizer state, and
+tensor-parallel local ownership. \\
+Linear-layer list & Identifies LoRA target modules and adapter parameter
+counts. \\
+Attention layout & Determines query and key/value widths, attention workspace,
+and long-context retained state. \\
+Distributed strategy & Changes rank ownership of gradients, optimizer state,
+parameters, buckets, and gather windows. \\
+Checkpointing flag & Changes retained activation state and adds backward
+recompute workspace. \\
 \bottomrule
 \end{tabular}
 \normalsize
 \end{center}
 
-Architecture still matters inside the non-eager family. The widened
-attention-path terms make some models grow faster than a plain hidden-size
-story would suggest:
+\subsection{Resident State}
+Resident state is the memory floor on one rank:
 \[
-M_{\mathrm{widened}}
-\propto
-L_{\mathrm{act}} \cdot T_{\mathrm{local}} \cdot d_{\mathrm{widened\ path}}.
-\]
-So even when two models share the same hidden size, the one with wider
-attention-path metadata can retain more activation state.
-
-\subsection{What Checkpointing Changes}
-Checkpointing does not magically remove all activation memory. What it changes
-is the number of layers that are allowed to keep full internal state at once.
-
-The current implementation uses a simple segmentation rule:
-\begin{itemize}[leftmargin=1.5em]
-\item without checkpointing, retained-forward classes can scale with the full
-layer stack,
-\item with checkpointing, only one checkpoint segment is allowed to retain its
-full internal state at a time.
-\end{itemize}
-
-In the current code that effective segment length is one block. That keeps the
-logic simple and aligns well with the measured checkpointed regimes in the
-canonical corpus.
-
-Viewed proportionally, checkpointing changes the layer factor much more than
-the token factor:
-\[
-M_{\mathrm{proxy}}^{\mathrm{ckpt}}
-\propto
-L_{\mathrm{act}} \cdot T_{\mathrm{local}} \cdot d_{\mathrm{retained}},
+R_{\mathrm{base}} =
+M_{\mathrm{params}} + M_{\mathrm{opt}} + M_{\mathrm{master}}
++ M_{\mathrm{runtime}} + M_{\mathrm{persist}},
 \qquad
-L_{\mathrm{act}} \ll L.
+R_{\mathrm{grad}} = R_{\mathrm{base}} + M_{\mathrm{grads}}.
 \]
-So checkpointing does not make activation memory stop scaling with sequence
-length. It mainly collapses the number of layers that can keep full retained
-state at once.
+Parameters are counted from explicit parameter shapes when available, with
+tensor-parallel sharding applied to row, column, and vocabulary-parallel
+tensors. ZeRO-3 shards trainable parameters across data-parallel ranks. LoRA
+keeps the dense base weights resident and makes the adapter tensors trainable,
+so gradients and optimizer state scale with adapter size.
 
-Written compactly:
+Optimizer memory is optimizer-specific. Adam and AdamW keep two state tensors,
+RMSProp and Adagrad keep one, SGD keeps none, and Adafactor uses factored state
+for matrix-like tensors. ZeRO-2 and ZeRO-3 shard optimizer state and gradients
+for tested optimizer paths. Runtime support is represented with named CUDA,
+allocator, NCCL, DeepSpeed, and backend-buffer terms.
+
+The local tensor count is computed before bytes are assigned. Tensor-parallel
+metadata determines whether a parameter is replicated or divided across the
+tensor-parallel group. ZeRO then applies data-parallel sharding to the training
+state owned by its stage. This order preserves the difference between a matrix
+partitioned by tensor parallelism and a state object partitioned by ZeRO.
+
+\begin{center}
+\small
+\begin{tabular}{@{}lll@{}}
+\toprule
+Object & Full fine-tuning & LoRA fine-tuning \\
+\midrule
+Base weights & resident & resident \\
+Trainable weights & dense model tensors & adapter tensors \\
+Gradients & dense trainable tensors & adapter gradients \\
+Optimizer state & dense trainable tensors & adapter optimizer state \\
+\bottomrule
+\end{tabular}
+\normalsize
+\end{center}
+
+This distinction is central for LLMs, because a full fine-tune must carry
+optimizer and gradient state for the dense model. A LoRA run still stores the
+base weights during forward and backward passes, while trainable-state memory demand is determined by
+the targeted projection layers and the selected adapter rank.
+
+For one dense matrix $W \in \mathbb{R}^{d_{\mathrm{out}}\times d_{\mathrm{in}}}$,
+full fine-tuning makes all $d_{\mathrm{out}}d_{\mathrm{in}}$ elements trainable.
+LoRA inserts
 \[
-L_{\mathrm{act}} =
-\begin{cases}
-L & \text{if checkpointing is off}, \\
-1 & \text{if checkpointing is on}.
-\end{cases}
+\Delta W = \frac{\alpha}{r}BA,\qquad
+A \in \mathbb{R}^{r\times d_{\mathrm{in}}},\quad
+B \in \mathbb{R}^{d_{\mathrm{out}}\times r},
 \]
+so the trainable count for that target becomes
+$r(d_{\mathrm{in}} + d_{\mathrm{out}})$. The dense base matrix remains part of
+resident parameter memory, while gradient and optimizer memory follow the
+adapter tensors. This gives the estimator a direct way to reason about rank,
+target module selection, and optimizer state without introducing a separate
+LoRA-only formula for the rest of the model.
 
-\subsection{Backward Activation State}
-Backward activation memory is not rebuilt from scratch. The estimator starts
-from the retained-forward proxy and then adds backward-only context:
+Optimizer state is handled at parameter-tensor granularity. Adam-style
+optimizers attach two state tensors to each trainable tensor. Adafactor uses
+row and column factors for matrix-like tensors, which is materially smaller for
+large projection matrices. This tensor-level treatment matters for mixed
+training modes: a run can have dense frozen base parameters, trainable adapter
+matrices, and optimizer state only for those adapters.
+
+\subsection{Retained Activations and Attention}
+Retained activation memory is a sum of terms:
 \[
-A_{\mathrm{bwd}} = M_{\mathrm{proxy}} + M_{\mathrm{bwd,extra}}.
+M_{\mathrm{act}} =
+M_{\mathrm{visible}} + M_{\mathrm{saved\ inputs}} + M_{\mathrm{mlp}}
++ M_{\mathrm{attn}} + M_{\mathrm{lora}} + M_{\mathrm{ckpt}}
++ M_{\mathrm{loss}} + M_{\mathrm{widened}}.
 \]
+Full fine-tuning grows with layer count, local token count, hidden width, MLP
+width, and attention-path width. LoRA reduces trainable activation pressure by
+moving gradients onto targeted adapter paths and low-rank intermediates.
+Gradient checkpointing stores fewer layer internals and shifts work into
+backward recomputation.
 
-The extra backward term covers objects that do not need to survive the whole
-forward pass but do need to exist while gradients are being computed. Examples
-include residual or normalization context and some saved-input state that only
-matters once backward begins.
+Attention backend matters most at long context length. Standard attention
+requires attention-score states that scale quadratically with sequence length.
+FlashAttention removes the need to store quadratic-length attention scores by
+using tiled computation and recomputation, with a smaller additional workspace
+term \cite{dao2022flashattention}. SimpleSFT therefore models FlashAttention
+primarily through retained attention-path context and workspace terms.
 
-Checkpointed distributed LoRA now uses a deliberately slim backward path. In
-DDP, ZeRO-2, and ZeRO-3, the forward proxy is the checkpoint boundary plus the
-loss-state term and the LoRA low-rank intermediates. Backward then adds only
-the saved linear-input context and the residual or normalization context that
-must become live once gradients are formed.
+Gradient checkpointing is modeled as a change to the activation life cycle.
+Layer internals that would be retained until backward are reduced, while a
+separate recompute window is added during backward. The estimator represents
+this through checkpoint-boundary bytes, saved linear-input bytes, residual and
+normalization context, and recompute workspace. This keeps the memory tradeoff
+visible: checkpointing lowers retained forward state and raises backward
+compute plus transient workspace.
 
-Viewed proportionally, backward keeps the same forward-retained base and adds a
-smaller extra context term:
+\subsection{Workspace and Phase Assembly}
+Workspace is modeled as a live window. The main terms are attention workspace,
+backward kernel workspace, recompute workspace, loss workspace, tensor/sequence
+parallel communication windows, optimizer update scratch, and distributed
+bucket objects.
+
+DDP contributes a reducer bucket and a communication-overlap window. ZeRO
+contributes all-gather, reduce, and prefetch buckets. Bucket capacities are
+derived from configured element counts and clipped by the local payload that
+can fill them. ZeRO optimizer pressure is the maximum of fetch, update, and
+communication subphases.
+
+The bucket model uses configured capacities and local payload caps. A reducer
+or all-gather bucket can reserve a large object, yet the active payload remains
+bounded by the data held on that rank. This makes the estimate responsive to
+both runtime settings and model size. ZeRO-2 keeps parameters resident while
+sharding optimizer state and gradients. ZeRO-3 also shards trainable
+parameters, adding parameter gather windows around computation.
+
+The final phase equations are:
 \[
-A_{\mathrm{bwd}}
-\propto
-M_{\mathrm{proxy}}
-+ T_{\mathrm{local}} \cdot d_{\mathrm{bwd,extra}}.
+\begin{aligned}
+M_{\mathrm{forward}} &= R_{\mathrm{base}} + A_{\mathrm{fwd}} + W_{\mathrm{fwd}}, \\
+M_{\mathrm{backward}} &= R_{\mathrm{grad}} + A_{\mathrm{bwd}} + W_{\mathrm{bwd}}, \\
+M_{\mathrm{optimizer}} &=
+R_{\mathrm{grad}} + E_{\mathrm{bwd}} + W_{\mathrm{opt}} + C_{\mathrm{opt}}.
+\end{aligned}
 \]
-This is why backward often remains larger than forward even after the retained
-proxy has already been counted.
+Here $E_{\mathrm{bwd}}$ is backward-end state such as gradients and live
+distributed buckets, and $C_{\mathrm{opt}}$ represents carryover that remains
+live at optimizer-step entry.
 
-Earlier versions also added an extra ZeRO-3 checkpointed visible-propagation
-slice on top of this path. Long-context OLMo 3 replay showed that this term
-systematically overcounted backward activation state, so the current estimator
-removes that addend and keeps the checkpointed distributed LoRA path aligned to
-named retained objects only.
+The phase assembly makes the peak source explicit. A forward peak usually
+signals parameter plus retained activation pressure. A backward peak usually
+signals the combination of gradients, retained or recomputed activations, and
+communication workspace. An optimizer-step peak usually signals optimizer
+state, update scratch, and ZeRO communication windows. Reporting this phase is
+important because two configurations can have similar total peaks while needing
+different fixes. For example, checkpointing helps a forward-activation peak,
+while ZeRO stage changes help persistent optimizer or gradient pressure.
 
-So the two activation views are:
-\begin{align*}
-A_{\mathrm{fwd}} &= M_{\mathrm{proxy}}, \\
-A_{\mathrm{bwd}} &= M_{\mathrm{proxy}} + M_{\mathrm{bwd,extra}}.
-\end{align*}
-
-\subsection{Why The Estimator Reports Two Activation Views}
-The public output exposes both:
-\begin{itemize}[leftmargin=1.5em]
-\item the retained-forward proxy, which is the best analytical match to the
-measured retained-activation observable,
-\item and the phase-local activation bucket that is used when a specific phase
-wins the peak.
-\end{itemize}
-
-This separation keeps the calibration honest. A measured forward-retained proxy
-should be compared to the estimator's retained-forward proxy, not to the
-backward activation bucket and not to the public breakdown after a different
-phase wins.
+\begin{center}
+\small
+\begin{tabular}{@{}p{0.22\linewidth}p{0.68\linewidth}@{}}
+\toprule
+Peak phase & Dominant terms SimpleSFT reports \\
+\midrule
+Forward & Base resident state, retained activations, attention workspace,
+loss-related state. \\
+Backward & Resident state with gradients, backward activation state,
+checkpoint recompute workspace, DDP or ZeRO communication windows. \\
+Optimizer step & Gradients, optimizer state, update scratch, ZeRO fetch and
+communication windows, carried state from backward. \\
+\bottomrule
+\end{tabular}
+\normalsize
+\end{center}

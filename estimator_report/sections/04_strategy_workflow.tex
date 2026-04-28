@@ -1,0 +1,100 @@
+\section{Strategy Selection and User Workflow}
+The estimator can answer one fixed-configuration question or search over a
+small set of feasible strategies. A candidate is an \texttt{EstimatorConfig}
+paired with a resolved \texttt{ModelSpec}. The CLI search path evaluates the
+requested resource and distributed-mode options, separates feasible and
+infeasible cases, and ranks candidates by feasibility, distributed-mode
+simplicity, and memory headroom.
+
+The simplicity order is:
+\[
+\texttt{tp\_only}
+\prec
+\texttt{ddp}
+\prec
+\texttt{zero2}
+\prec
+\texttt{zero3}.
+\]
+This favors a smaller distributed stack when the memory estimate permits it.
+The UI uses a richer candidate set over distributed mode,
+checkpointing, tensor-parallel degree, and sequence-parallel settings. DDP and
+ZeRO require enough GPUs for data parallelism after tensor parallelism is
+assigned, while sequence parallelism requires tensor parallelism.
+
+Candidate generation follows the same constraints a user would apply by hand.
+The resource pool determines the available GPU count and memory budget. Tensor
+parallelism consumes GPUs inside each model replica. Data parallelism then uses
+the remaining replica count. ZeRO stages are considered only when a data
+parallel group exists. Sequence parallelism is paired with tensor parallelism,
+since it partitions sequence-local activation state across the tensor-parallel
+group.
+
+\begin{center}
+\small
+\begin{tabular}{@{}p{0.25\linewidth}p{0.65\linewidth}@{}}
+\toprule
+Strategy family & Search treatment \\
+\midrule
+Single GPU & Used when only one GPU is specified. \\
+Tensor parallel & Shards eligible matrices and associated tensor-local state
+across the tensor-parallel group. \\
+DDP & Replicates model state and changes communication workspace through
+reducer buckets. \\
+ZeRO-2 & Shards gradients and optimizer state across data-parallel ranks. \\
+ZeRO-3 & Shards trainable parameters as well, adding gather and prefetch
+windows around computation. \\
+LoRA & Changes trainable tensors and optimizer state through adapter rank and
+target modules. \\
+\bottomrule
+\end{tabular}
+\normalsize
+\end{center}
+
+Among feasible results, the reported headroom gives the user a practical margin against
+allocator variation, dataloader details, and small differences between the
+synthetic estimate and the real training script. The search output therefore
+contains both the selected candidate and the alternatives, allowing a user to
+choose a slower option with more margin when the cluster allocation is scarce.
+
+\subsection{Slowdown Model}
+Slowdown estimation is separate from memory estimation. The web recommendation
+path uses a small heuristic prior:
+\[
+R_{\mathrm{slow}} =
+\left(1 + s_{\mathrm{dist}}\right)
+\left(1 + s_{\mathrm{ckpt}}\right)
+\left(1 + s_{\mathrm{tp}}\right)
+\left(1 + s_{\mathrm{sp}}\right) - 1.
+\]
+The distributed-mode priors are $0\%$ for single-GPU and pure tensor
+parallelism, $3\%$ for DDP, $8\%$ for ZeRO-2, and $18\%$ for ZeRO-3.
+Checkpointing contributes $30\%$ because recomputation increases backward
+work. Tensor parallelism contributes $0.08\log_2(T_{\mathrm{P}})$, and
+sequence parallelism contributes $4\%$ when enabled.
+
+The slowdown score is simple because estimating training time is a hard problem
+outside the scope of this project. It expresses the expected slowdown
+relative to the least-sharded feasible candidate.
+For example, checkpointing receives a large penalty because it trades memory for
+extra backward compute. ZeRO-3 receives a larger distributed penalty than
+ZeRO-2 because parameter gathering introduces additional synchronization and
+workspace.
+
+\subsection{Training Export}
+Search results can be exported into a TRL-compatible YAML strategy. The export
+contains the model reference, tuning mode, optimizer and precision choices,
+sequence length, checkpointing, attention backend, distributed strategy, and
+LoRA fields when applicable. The training runner consumes the first exported
+candidate by default. In the intended workflow, the user searches over model,
+context length, resource pool, and distributed strategy, exports the best
+candidate, and launches training from that file:
+
+\begin{verbatim}
+simplesft search <HF Model> ... --export-file ./trl_strategy.yaml
+simplesft train --config ./trl_strategy.yaml --dataset <HF Dataset>
+\end{verbatim}
+
+The command-line interface and web server return the same core objects: peak
+memory, feasibility, phase records, component breakdowns, assumptions, and
+diagnostic metadata.
