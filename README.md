@@ -2,6 +2,17 @@
 
 SimpleSFT measures and estimates peak memory for supervised fine-tuning runs.
 
+## Web UI
+
+The web UI is a local stdlib server. It exposes a form-driven estimator
+workbench on `/` and a JSON API on `/api/estimate`.
+
+```bash
+simplesft web --host 127.0.0.1 --port 8765
+```
+
+![SimpleSFT web UI screenshot](estimator_report/sections/image.png)
+
 ## Goals
 
 - Measure real training-step memory with granular phase and component breakdowns.
@@ -47,11 +58,6 @@ simplesft benchmark sshleifer/tiny-gpt2 --output-dir benchmark_artifacts/iter1 -
 simplesft rebuild-benchmark --source-dir benchmark_artifacts/iter1 --output-dir benchmark_artifacts/iter2
 simplesft report --input-dir benchmark_artifacts/iter1 --iteration-name "Iteration 1"
 ```
-
-The web UI is a local stdlib server. It exposes a form-driven estimator
-workbench on `/` and a JSON API on `/api/estimate`.
-
-![SimpleSFT web UI screenshot](estimator_report/sections/image.png)
 
 ## Training (SFT)
 
